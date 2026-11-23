@@ -1,0 +1,12 @@
+[input]
+entrypoint = 0xE0002850
+symbols_file_path = "gauntlet.syms.toml"
+rom_file_path = "gauntlet_code.bin"
+output_func_path = "RecompiledFuncs"
+functions_per_output_file = 50
+trace_mode = true
+recomp_include = "#include \"recomp.h\"\n#include \"gauntlet_trace.h\""
+
+[patches]
+stubs = []
+ignored = ["gl_atomic_andnot", "gl_atomic_dec", "gl_atomic_inc", "gl_atomic_or", "gl_cache_create_dirty", "gl_cache_line", "gl_exc_E009EEF4", "gl_exc_E009EFE4", "gl_exc_E009F0EC", "gl_exc_E009F144", "gl_get_sp", "gl_idle", "gl_interp_E0097620", "gl_interp_E0097714", "gl_interp_E0097994"]

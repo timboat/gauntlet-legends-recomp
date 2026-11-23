@@ -1,0 +1,82 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fc06930..c24555b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -90,7 +90,7 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+     if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 20.0)
+         add_compile_options(-Wno-deprecated-literal-operator -Wno-nontrivial-memcall)
+     endif()
+-    add_compile_options(-Werror)
++    # add_compile_options(-Werror)  # gauntlet: newer clang adds warnings in bundled imgui
+ endif()
+ 
+ set(ANDROID_PLATFORM android-24)
+diff --git a/src/hle/rt64_interpreter.cpp b/src/hle/rt64_interpreter.cpp
+index dccaa87..f35a589 100644
+--- a/src/hle/rt64_interpreter.cpp
++++ b/src/hle/rt64_interpreter.cpp
+@@ -5,6 +5,7 @@
+ #include "rt64_interpreter.h"
+ 
+ #include <cassert>
++#include <cstdio>
+ 
+ //#define DUMP_DISPLAY_LISTS
+ 
+@@ -169,7 +170,13 @@ namespace RT64 {
+         DisplayList *dl = dlStart;
+         uint8_t opCode;
+         GBIFunction func;
++        // A corrupt list can branch back on itself; cut it off instead of queueing draws until memory runs out.
++        uint32_t commandBudget = 4000000;
+         while (dl != nullptr) {
++            if (--commandBudget == 0) {
++                fprintf(stderr, "[rt64] display list at 0x%X exceeded the command limit; stopped\n", dlStartAdddress);
++                break;
++            }
+             opCode = (dl->w0 >> 24);
+ 
+             if ((extendedOpCode != 0) && (opCode == extendedOpCode)) {
+diff --git a/src/hle/rt64_rsp.cpp b/src/hle/rt64_rsp.cpp
+index ea0c1ac..6932810 100644
+--- a/src/hle/rt64_rsp.cpp
++++ b/src/hle/rt64_rsp.cpp
+@@ -316,7 +316,13 @@ namespace RT64 {
+         modelViewProjChanged = changed;
+     }
+ 
++    // Gauntlet debug: recent vertex loads, printed when a triangle references an unloaded slot.
++    static uint32_t gtVtxRing[8][4];
++    static uint32_t gtVtxPos = 0;
++
+     void RSP::setVertex(uint32_t address, uint8_t vtxCount, uint32_t dstIndex) {
++        gtVtxRing[gtVtxPos % 8][0] = address; gtVtxRing[gtVtxPos % 8][1] = fromSegmentedMasked(address);
++        gtVtxRing[gtVtxPos % 8][2] = vtxCount; gtVtxRing[gtVtxPos % 8][3] = dstIndex; gtVtxPos++;
+         if ((dstIndex >= RSP_MAX_VERTICES) || ((dstIndex + vtxCount) > RSP_MAX_VERTICES)) {
+             assert(false && "Vertex indices are not valid. DL is possibly corrupted.");
+             return;
+@@ -1001,6 +1007,24 @@ namespace RT64 {
+         auto &minMatrix = drawCall.minWorldMatrix;
+         auto &maxMatrix = drawCall.maxWorldMatrix;
+         uint32_t globalIndices[3];
++        if (!rawGlobalIndices) {
++            // Gauntlet: guard against triangles that reference vertex slots not loaded in this task.
++            const uint32_t vertexCount = uint32_t(workload.drawData.vertexCount());
++            if ((a >= RSP_MAX_VERTICES) || (b >= RSP_MAX_VERTICES) || (c >= RSP_MAX_VERTICES) ||
++                (indices[a] >= vertexCount) || (indices[b] >= vertexCount) || (indices[c] >= vertexCount))
++            {
++                static int badTriLogs = 0;
++                if (badTriLogs++ < 20) {
++                    fprintf(stderr, "[rt64] bad tri %u %u %u (global %u %u %u, loaded %u)\n", a, b, c,
++                        indices[a % RSP_MAX_VERTICES], indices[b % RSP_MAX_VERTICES], indices[c % RSP_MAX_VERTICES], vertexCount);
++                    for (uint32_t k = 0; k < 8; k++) {
++                        const uint32_t *r = gtVtxRing[(gtVtxPos + k) % 8];
++                        fprintf(stderr, "    vtx seg %08X phys %06X n %u dst %u\n", r[0], r[1], r[2], r[3]);
++                    }
++                }
++                return;
++            }
++        }
+         if (rawGlobalIndices) {
+             globalIndices[0] = a;
+             globalIndices[1] = b;

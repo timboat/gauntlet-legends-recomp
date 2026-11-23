@@ -1,0 +1,13 @@
+diff --git a/src/main.cpp b/src/main.cpp
+index 669c4a1..5a32ecc 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -471,7 +471,7 @@ int main(int argc, char** argv) {
+ 
+             for (uint32_t func_index : context.functions_by_vram[config.entrypoint]) {
+                 auto& func = context.functions[func_index];
+-                if (func.rom == 0x1000) {
++                if (true) { // gauntlet: entry is inside a decompressed segment, not at rom 0x1000
+                     rename_function(func_index, "recomp_entrypoint");
+                     found_entrypoint = true;
+                     break;

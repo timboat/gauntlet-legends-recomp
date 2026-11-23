@@ -1,0 +1,4 @@
+cmake>=3.24
+ninja>=1.11
+zstandard>=0.22   # the portable LLVM download (.tar.zst)
+Pillow>=10.1      # the Vita LiveArea images (vita/make_livearea.py)

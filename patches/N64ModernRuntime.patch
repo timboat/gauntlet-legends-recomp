@@ -1,0 +1,1318 @@
+diff --git a/librecomp/include/librecomp/addresses.hpp b/librecomp/include/librecomp/addresses.hpp
+index b1b50cb..291a0b5 100644
+--- a/librecomp/include/librecomp/addresses.hpp
++++ b/librecomp/include/librecomp/addresses.hpp
+@@ -11,11 +11,11 @@ namespace recomp {
+     // 4GB (the full address space)
+     constexpr size_t allocation_size = 4096ULL * 1024ULL * 1024ULL;
+     // We need a place in rdram to hold the PI handles, so pick an address in extended rdram
+-    constexpr int32_t cart_handle = 0x80800000;
++    constexpr int32_t cart_handle = 0x80A00000; // gauntlet: 0x80800000+ is used by overlays (0xE08xxxxx)
+     constexpr int32_t drive_handle = (int32_t)(cart_handle + sizeof(OSPiHandle));
+     constexpr int32_t flash_handle = (int32_t)(drive_handle + sizeof(OSPiHandle));
+     constexpr int32_t flash_handle_end = (int32_t)(flash_handle + sizeof(OSPiHandle));
+-    constexpr int32_t patch_rdram_start = 0x80801000;
++    constexpr int32_t patch_rdram_start = 0x80A01000;
+     static_assert(patch_rdram_start >= flash_handle_end);
+     constexpr int32_t mod_rdram_start = 0x81000000;
+ 
+diff --git a/librecomp/include/librecomp/rsp_vu.hpp b/librecomp/include/librecomp/rsp_vu.hpp
+index 2fbbd8a..3b791ff 100644
+--- a/librecomp/include/librecomp/rsp_vu.hpp
++++ b/librecomp/include/librecomp/rsp_vu.hpp
+@@ -24,7 +24,8 @@
+ #define ARCHITECTURE_SUPPORTS_SSE4_1 1
+ #include <nmmintrin.h>
+ using v128 = __m128i;
+-#elif defined(__aarch64__) || defined(_M_ARM64)
++#elif defined(__aarch64__) || defined(_M_ARM64) || (defined(__arm__) && defined(__ARM_NEON) && !defined(RSP_FORCE_SISD))
++// 32-bit ARM with NEON too (Vita): the scalar path builds 48-bit accumulators per lane and is several times slower.
+ #define ARCHITECTURE_SUPPORTS_SSE4_1 1
+ #include <sse2neon.h>
+ using v128 = __m128i;
+@@ -95,6 +96,10 @@ struct RSP {
+         auto set(u32 index, bool value) -> bool { return u16(index) = 0 - value, value; }
+ 
+         //vu-registers.cpp
++#if defined(__GNUC__)
++        // Always inlined: in the huge recompiled microcode functions GCC otherwise calls it with a run-time index.
++        __attribute__((always_inline))
++#endif
+         inline auto operator()(u32 index) const -> r128;
+     };
+     using cr128 = const r128;
+diff --git a/librecomp/include/librecomp/rsp_vu_impl.hpp b/librecomp/include/librecomp/rsp_vu_impl.hpp
+index dbf46b2..90fe53d 100644
+--- a/librecomp/include/librecomp/rsp_vu_impl.hpp
++++ b/librecomp/include/librecomp/rsp_vu_impl.hpp
+@@ -62,6 +62,35 @@ auto RSP::r128::operator()(u32 index) const -> r128 {
+ 
+     if constexpr (Accuracy::RSP::SIMD) {
+ #if ARCHITECTURE_SUPPORTS_SSE4_1
++        // Cases 0 and 1 are the vector itself. On 32-bit ARM the other cases use NEON lane operations: sse2neon
++        // emulates the byte shuffle with two table lookups, and the guarded static table costs a check per use.
++        if (index < 2) return *this;
++#if defined(__arm__)
++        {
++            uint16x8_t x = vreinterpretq_u16_s64(vreinterpretq_s64_m128i(v128));
++            uint16x4_t lo = vget_low_u16(x), hi = vget_high_u16(x);
++            uint16x8_t d;
++            switch (index) { // element n sits in lane 7 - n
++            case 2:  d = vtrnq_u16(x, x).val[1]; break;                                  // 00224466
++            case 3:  d = vtrnq_u16(x, x).val[0]; break;                                  // 11335577
++            case 4:  d = vcombine_u16(vdup_lane_u16(lo, 3), vdup_lane_u16(hi, 3)); break; // 00004444
++            case 5:  d = vcombine_u16(vdup_lane_u16(lo, 2), vdup_lane_u16(hi, 2)); break;
++            case 6:  d = vcombine_u16(vdup_lane_u16(lo, 1), vdup_lane_u16(hi, 1)); break;
++            case 7:  d = vcombine_u16(vdup_lane_u16(lo, 0), vdup_lane_u16(hi, 0)); break;
++            case 8:  d = vdupq_lane_u16(hi, 3); break;
++            case 9:  d = vdupq_lane_u16(hi, 2); break;
++            case 10: d = vdupq_lane_u16(hi, 1); break;
++            case 11: d = vdupq_lane_u16(hi, 0); break;
++            case 12: d = vdupq_lane_u16(lo, 3); break;
++            case 13: d = vdupq_lane_u16(lo, 2); break;
++            case 14: d = vdupq_lane_u16(lo, 1); break;
++            default: d = vdupq_lane_u16(lo, 0); break;
++            }
++            r128 ret;
++            ret.v128 = vreinterpretq_m128i_s64(vreinterpretq_s64_u16(d));
++            return ret;
++        }
++#else
+         static const __m128i shuffle[16] = {
+             //vector
+             _mm_set_epi8(15,14,13,12,11,10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0),  //01234567
+@@ -84,10 +113,10 @@ auto RSP::r128::operator()(u32 index) const -> r128 {
+             _mm_set_epi8(3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2),  //66666666
+             _mm_set_epi8(1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0),  //77777777
+         };
+-        //todo: benchmark to see if testing for cases 0&1 to return value directly is faster
+         r128 ret;
+         ret.v128 = _mm_shuffle_epi8(v128, shuffle[index]);
+         return ret;
++#endif
+ #endif
+     }
+ }
+@@ -165,6 +194,19 @@ auto RSP::CTC2(cr32& rt, u8 rd) -> void {
+     }
+ }
+ 
++
++// Word-at-a-time DMEM <-> vector copies for the common aligned cases (32-bit ARM, where the byte loops below
++// dominate the audio microcode). DMEM holds big-endian bytes in host-order words (byte a at dmem[a ^ 3]), and an
++// r128 keeps byte 0 in its last memory byte, so bytes 4g..4g+3 of a vector are the host word u32[3 - g].
++#if defined(__arm__) || defined(RSP_FAST_LS)
++#define RSP_FAST_LS_ENABLED 1
++static inline u32 rsp_dmem_word(u32 a) {
++    // Big-endian word starting at any even address.
++    if ((a & 3) == 0) return *(const u32*)(dmem + (a & 0xFFC));
++    return *(const u32*)(dmem + ((a - 2) & 0xFFC)) << 16 | *(const u32*)(dmem + ((a + 2) & 0xFFC)) >> 16;
++}
++#endif
++
+ template<u8 e>
+ auto RSP::LBV(r128& vt, cr32& rs, s8 imm) -> void {
+     auto address = rs + imm;
+@@ -174,6 +216,16 @@ auto RSP::LBV(r128& vt, cr32& rs, s8 imm) -> void {
+ template<u8 e>
+ auto RSP::LDV(r128& vt, cr32& rs, s8 imm) -> void {
+     auto address = rs + imm * 8;
++#ifdef RSP_FAST_LS_ENABLED
++    if constexpr (e == 0 || e == 8) {
++        if ((address & 1) == 0) {
++            u32* w = (u32*)&vt.u128;
++            w[e == 0 ? 3 : 1] = rsp_dmem_word(address);
++            w[e == 0 ? 2 : 0] = rsp_dmem_word(address + 4);
++            return;
++        }
++    }
++#endif
+     auto start = e;
+     auto end = std::min(start + 8, 16);
+     for (u32 offset = start; offset < end; offset++) {
+@@ -231,6 +283,16 @@ auto RSP::LPV(r128& vt, cr32& rs, s8 imm) -> void {
+ template<u8 e>
+ auto RSP::LQV(r128& vt, cr32& rs, s8 imm) -> void {
+     auto address = rs + imm * 16;
++#ifdef RSP_FAST_LS_ENABLED
++    if constexpr (e == 0) {
++        if ((address & 15) == 0) {
++            const u32* d = (const u32*)(dmem + (address & 0xFF0));
++            u32* w = (u32*)&vt.u128;
++            w[3] = d[0]; w[2] = d[1]; w[1] = d[2]; w[0] = d[3];
++            return;
++        }
++    }
++#endif
+     auto start = e;
+     auto end = std::min((u32)(16 + e - (address & 15)), (u32)16);
+     for (u32 offset = start; offset < end; offset++) {
+@@ -421,6 +483,16 @@ auto RSP::SPV(cr128& vt, cr32& rs, s8 imm) -> void {
+ template<u8 e>
+ auto RSP::SQV(cr128& vt, cr32& rs, s8 imm) -> void {
+     auto address = rs + imm * 16;
++#ifdef RSP_FAST_LS_ENABLED
++    if constexpr (e == 0) {
++        if ((address & 15) == 0) {
++            u32* d = (u32*)(dmem + (address & 0xFF0));
++            const u32* w = (const u32*)&vt.u128;
++            d[0] = w[3]; d[1] = w[2]; d[2] = w[1]; d[3] = w[0];
++            return;
++        }
++    }
++#endif
+     auto start = e;
+     auto end = start + (16 - (address & 15));
+     for (u32 offset = start; offset < end; offset++) {
+diff --git a/librecomp/src/files.cpp b/librecomp/src/files.cpp
+index af6f18d..463dd06 100644
+--- a/librecomp/src/files.cpp
++++ b/librecomp/src/files.cpp
+@@ -28,6 +28,26 @@ std::ofstream recomp::open_output_file_with_backup(const std::filesystem::path&
+     return temp_file_out;
+ }
+ 
++// std::filesystem::copy_file leaves an empty destination on the Vita's newlib, so copy through streams instead.
++static bool copy_file_contents(const std::filesystem::path& from, const std::filesystem::path& to) {
++    std::ifstream in{from, std::ios_base::binary};
++    if (!in.good()) {
++        return false;
++    }
++    std::ofstream out{to, std::ios_base::binary | std::ios_base::trunc};
++    if (!out.good()) {
++        return false;
++    }
++    char buffer[4096];
++    while (in.read(buffer, sizeof(buffer)) || in.gcount() > 0) {
++        if (!out.write(buffer, in.gcount())) {
++            return false;
++        }
++    }
++    out.flush();
++    return !in.bad() && out.good();
++}
++
+ bool recomp::finalize_output_file_with_backup(const std::filesystem::path& filepath) {
+     std::filesystem::path backup_path{filepath};
+     backup_path += backup_suffix;
+@@ -36,14 +56,13 @@ bool recomp::finalize_output_file_with_backup(const std::filesystem::path& filep
+     temp_path += temp_suffix;
+ 
+     std::error_code ec;
+-    if (std::filesystem::exists(filepath, ec)) {
+-        std::filesystem::copy_file(filepath, backup_path, std::filesystem::copy_options::overwrite_existing, ec);
+-        if (ec) {
++    // Only back up a non-empty file, so a broken earlier save can't replace a good backup.
++    if (std::filesystem::exists(filepath, ec) && std::filesystem::file_size(filepath, ec) > 0 && !ec) {
++        if (!copy_file_contents(filepath, backup_path)) {
+             return false;
+         }
+     }
+-    std::filesystem::copy_file(temp_path, filepath, std::filesystem::copy_options::overwrite_existing, ec);
+-    if (ec) {
++    if (!copy_file_contents(temp_path, filepath)) {
+         return false;
+     }
+     std::filesystem::remove(temp_path, ec);
+diff --git a/librecomp/src/pak.cpp b/librecomp/src/pak.cpp
+index 0be1513..a768051 100644
+--- a/librecomp/src/pak.cpp
++++ b/librecomp/src/pak.cpp
+@@ -1,51 +1,431 @@
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <fstream>
++#include <mutex>
++
+ #include "ultramodern/ultra64.h"
+ #include "ultramodern/ultramodern.hpp"
+ 
+ #include "recomp.h"
+-#include "helpers.hpp"
++#include "librecomp/files.hpp"
++
++// Controller Pak emulation. Each controller port gets a 32 KB image in the standard .mpk layout (the same raw
++// format N64 emulators use), stored next to the game's other saves as controller_pak_<n>.mpk. The libultra
++// file-system calls (osPfs*) are implemented directly on that image, so no SI/pak protocol is emulated.
++//
++// Layout (256-byte pages): page 0 = ID area, page 1 = inode table, page 2 = inode table copy,
++// pages 3-4 = 16 note (directory) entries, pages 5-127 = file data. Inode entries are 16-bit:
++// 0x0001 ends a file, 0x0003 marks a free page, otherwise the next page of the file.
++
++namespace {
++    constexpr int pak_size = 0x8000;
++    constexpr int page_size = 0x100;
++    constexpr int num_pages = 128;
++    constexpr int first_data_page = 5;
++    constexpr int inode_page = 1;
++    constexpr int inode_backup_page = 2;
++    constexpr int dir_page = 3;
++    constexpr int dir_entries = 16;
++    constexpr int dir_entry_size = 32;
++
++    constexpr uint16_t inode_last = 0x0001;
++    constexpr uint16_t inode_free = 0x0003;
++
++    constexpr s32 PFS_ERR_NOPACK = 1;
++    constexpr s32 PFS_ERR_INVALID = 5;
++    constexpr s32 PFS_DATA_FULL = 7;
++    constexpr s32 PFS_DIR_FULL = 8;
++    constexpr s32 PFS_ERR_EXIST = 9;
++
++    constexpr int max_paks = 4;
++
++    struct Pak {
++        bool loaded = false;
++        std::array<uint8_t, pak_size> data{};
++    };
++
++    std::array<Pak, max_paks> paks;
++    std::mutex pak_mutex;
++
++    uint16_t get16(const uint8_t* p) { return uint16_t((p[0] << 8) | p[1]); }
++    uint32_t get32(const uint8_t* p) { return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3]; }
++    void put16(uint8_t* p, uint16_t v) { p[0] = uint8_t(v >> 8); p[1] = uint8_t(v); }
++    void put32(uint8_t* p, uint32_t v) { p[0] = uint8_t(v >> 24); p[1] = uint8_t(v >> 16); p[2] = uint8_t(v >> 8); p[3] = uint8_t(v); }
++
++    std::filesystem::path pak_path(int channel) {
++        std::filesystem::path folder = ultramodern::get_save_file_path().parent_path();
++        return folder / ("controller_pak_" + std::to_string(channel + 1) + ".mpk");
++    }
++
++    uint8_t* inode(Pak& pak, int page) { return &pak.data[inode_page * page_size + page * 2]; }
++    uint8_t* dir_entry(Pak& pak, int file_no) { return &pak.data[dir_page * page_size + file_no * dir_entry_size]; }
++
++    // Inode checksum: low byte of the sum of the data-page entries, kept in byte 1 of the table.
++    void finish_inode_table(Pak& pak) {
++        uint8_t* table = &pak.data[inode_page * page_size];
++        uint32_t sum = 0;
++        for (int i = first_data_page * 2; i < page_size; i++) {
++            sum += table[i];
++        }
++        table[1] = uint8_t(sum);
++        memcpy(&pak.data[inode_backup_page * page_size], table, page_size);
++    }
++
++    void format(Pak& pak) {
++        pak.data.fill(0);
++        // ID block (repeated at 0x20, 0x60, 0x80 and 0xC0): serial data, device id 1, one bank, then the
++        // checksum and inverted checksum over its first 28 bytes.
++        uint8_t id[32]{};
++        const uint8_t serial[24] = { 0xFF, 0xFF, 0xFF, 0xFF, 0x05, 0x1A, 0x5F, 0x13, 0x00, 0x00, 0x00, 0x00,
++                                     0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
++        memcpy(id, serial, sizeof(serial));
++        put16(&id[0x18], 0x0001);
++        id[0x1A] = 0x01;
++        id[0x1B] = 0x00;
++        uint16_t sum = 0, inv = 0;
++        for (int i = 0; i < 0x1C; i += 2) {
++            uint16_t w = get16(&id[i]);
++            sum += w;
++            inv += uint16_t(~w);
++        }
++        put16(&id[0x1C], sum);
++        put16(&id[0x1E], inv);
++        for (int offset : { 0x20, 0x60, 0x80, 0xC0 }) {
++            memcpy(&pak.data[offset], id, sizeof(id));
++        }
++        pak.data[0] = 0x81;
++        for (int i = 1; i < 0x20; i++) {
++            pak.data[i] = uint8_t(i);
++        }
++
++        for (int page = 1; page < num_pages; page++) {
++            put16(inode(pak, page), inode_free);
++        }
++        put16(inode(pak, 0), 0);
++        finish_inode_table(pak);
++    }
++
++    Pak& load(int channel) {
++        Pak& pak = paks[channel];
++        if (!pak.loaded) {
++            pak.loaded = true;
++            // Take the first full image: the save, its backup, then a temp file left by a write that didn't finish.
++            std::filesystem::path path = pak_path(channel);
++            bool read = false;
++            for (const char* suffix : {"", ".bak", ".temp"}) {
++                std::filesystem::path candidate = path;
++                candidate += suffix;
++                std::ifstream file{candidate, std::ios_base::binary};
++                if (file.good() && file.read(reinterpret_cast<char*>(pak.data.data()), pak_size)) {
++                    read = true;
++                    break;
++                }
++            }
++            if (!read) {
++                format(pak);
++            }
++        }
++        return pak;
++    }
++
++    void store(int channel) {
++        std::filesystem::path path = pak_path(channel);
++        std::error_code ec;
++        std::filesystem::create_directories(path.parent_path(), ec);
++        bool ok = false;
++        {
++            std::ofstream file = recomp::open_output_file_with_backup(path, std::ios_base::binary);
++            if (file.good()) {
++                file.write(reinterpret_cast<const char*>(paks[channel].data.data()), pak_size);
++                ok = file.good();
++            }
++        }
++        if (!ok || !recomp::finalize_output_file_with_backup(path)) {
++            ultramodern::error_handling::message_box("Failed to write the Controller Pak save file. Check your file permissions.");
++        }
++    }
++
++    int pfs_channel(uint8_t* rdram, gpr pfs) {
++        int channel = MEM_W(0x08, pfs);
++        return (channel >= 0 && channel < max_paks) ? channel : -1;
++    }
++
++    bool entry_used(const uint8_t* e) { return get32(&e[0]) != 0 || get16(&e[4]) != 0; }
++
++    int count_pages(Pak& pak, int start) {
++        int pages = 0;
++        int page = start;
++        while (page >= first_data_page && page < num_pages && pages < num_pages) {
++            pages++;
++            uint16_t next = get16(inode(pak, page));
++            if (next == inode_last) {
++                break;
++            }
++            page = next & 0xFF;
++        }
++        return pages;
++    }
++
++    int free_pages(Pak& pak) {
++        int count = 0;
++        for (int page = first_data_page; page < num_pages; page++) {
++            count += get16(inode(pak, page)) == inode_free;
++        }
++        return count;
++    }
++
++    int find_file(uint8_t* rdram, Pak& pak, uint16_t company, uint32_t game, gpr game_name, gpr ext_name) {
++        for (int i = 0; i < dir_entries; i++) {
++            const uint8_t* e = dir_entry(pak, i);
++            if (get32(&e[0]) != game || get16(&e[4]) != company) {
++                continue;
++            }
++            bool match = true;
++            for (int j = 0; j < 16 && match; j++) {
++                match = e[16 + j] == MEM_BU(j, game_name);
++            }
++            for (int j = 0; j < 4 && match; j++) {
++                match = e[12 + j] == MEM_BU(j, ext_name);
++            }
++            if (match) {
++                return i;
++            }
++        }
++        return -1;
++    }
+ 
++    void free_chain(Pak& pak, int start) {
++        int page = start;
++        for (int n = 0; n < num_pages && page >= first_data_page && page < num_pages; n++) {
++            uint16_t next = get16(inode(pak, page));
++            put16(inode(pak, page), inode_free);
++            if (next == inode_last || next == inode_free) {
++                break;
++            }
++            page = next & 0xFF;
++        }
++    }
++}
++
++// osPfsInitPak(mq, pfs, channel)
+ extern "C" void osPfsInitPak_recomp(uint8_t * rdram, recomp_context* ctx) {
+-    ctx->r2 = 1; // PFS_ERR_NOPACK
++    gpr pfs = ctx->r5;
++    int channel = (int)ctx->r6;
++    if (channel < 0 || channel >= max_paks) {
++        ctx->r2 = PFS_ERR_NOPACK;
++        return;
++    }
++    std::lock_guard lock{ pak_mutex };
++    Pak& pak = load(channel);
++
++    MEM_W(0x00, pfs) = 1; // PFS_INITIALIZED
++    MEM_W(0x04, pfs) = (int32_t)ctx->r4;
++    MEM_W(0x08, pfs) = channel;
++    for (int i = 0; i < 32; i++) {
++        MEM_BU(0x0C + i, pfs) = pak.data[0x20 + i];
++        MEM_BU(0x2C + i, pfs) = 0;
++    }
++    MEM_W(0x4C, pfs) = 0;                     // version
++    MEM_W(0x50, pfs) = dir_entries;           // dir_size
++    MEM_W(0x54, pfs) = inode_page * 8;        // inode_table (in 32-byte blocks)
++    MEM_W(0x58, pfs) = inode_backup_page * 8; // minode_table
++    MEM_W(0x5C, pfs) = dir_page * 8;          // dir_table
++    MEM_W(0x60, pfs) = first_data_page;       // inode_start_page
++    MEM_BU(0x64, pfs) = 1;                    // banks
++    MEM_BU(0x65, pfs) = 0;                    // activebank
++    ctx->r2 = 0;
+ }
+ 
++// osPfsFreeBlocks(pfs, s32* bytes_not_used)
+ extern "C" void osPfsFreeBlocks_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    ctx->r2 = 1; // PFS_ERR_NOPACK
++    int channel = pfs_channel(rdram, ctx->r4);
++    if (channel < 0) { ctx->r2 = PFS_ERR_NOPACK; return; }
++    std::lock_guard lock{ pak_mutex };
++    MEM_W(0, ctx->r5) = free_pages(load(channel)) * page_size;
++    ctx->r2 = 0;
+ }
+ 
++// osPfsAllocateFile(pfs, company_code, game_code, game_name, ext_name, file_length, s32* file_no)
+ extern "C" void osPfsAllocateFile_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    ctx->r2 = 1; // PFS_ERR_NOPACK
++    int channel = pfs_channel(rdram, ctx->r4);
++    if (channel < 0) { ctx->r2 = PFS_ERR_NOPACK; return; }
++    uint16_t company = (uint16_t)ctx->r5;
++    uint32_t game = (uint32_t)ctx->r6;
++    gpr game_name = ctx->r7;
++    gpr ext_name = (gpr)MEM_W(0x10, ctx->r29);
++    int32_t length = MEM_W(0x14, ctx->r29);
++    gpr file_no_out = (gpr)MEM_W(0x18, ctx->r29);
++
++    if (company == 0 || game == 0 || length <= 0) { ctx->r2 = PFS_ERR_INVALID; return; }
++
++    std::lock_guard lock{ pak_mutex };
++    Pak& pak = load(channel);
++    if (find_file(rdram, pak, company, game, game_name, ext_name) >= 0) { ctx->r2 = PFS_ERR_EXIST; return; }
++
++    int pages = (length + page_size - 1) / page_size;
++    if (pages > free_pages(pak)) { ctx->r2 = PFS_DATA_FULL; return; }
++    int file_no = -1;
++    for (int i = 0; i < dir_entries; i++) {
++        if (!entry_used(dir_entry(pak, i))) { file_no = i; break; }
++    }
++    if (file_no < 0) { ctx->r2 = PFS_DIR_FULL; return; }
++
++    int start = -1, prev = -1;
++    for (int page = first_data_page; page < num_pages && pages > 0; page++) {
++        if (get16(inode(pak, page)) != inode_free) {
++            continue;
++        }
++        if (prev < 0) {
++            start = page;
++        } else {
++            put16(inode(pak, prev), (uint16_t)page);
++        }
++        put16(inode(pak, page), inode_last);
++        memset(&pak.data[page * page_size], 0, page_size);
++        prev = page;
++        pages--;
++    }
++    finish_inode_table(pak);
++
++    uint8_t* e = dir_entry(pak, file_no);
++    memset(e, 0, dir_entry_size);
++    put32(&e[0], game);
++    put16(&e[4], company);
++    put16(&e[6], (uint16_t)start);
++    e[8] = 0x02; // DIR_STATUS_OCCUPIED
++    for (int j = 0; j < 4; j++) e[12 + j] = MEM_BU(j, ext_name);
++    for (int j = 0; j < 16; j++) e[16 + j] = MEM_BU(j, game_name);
++
++    store(channel);
++    MEM_W(0, file_no_out) = file_no;
++    ctx->r2 = 0;
+ }
+ 
++// osPfsDeleteFile(pfs, company_code, game_code, game_name, ext_name)
+ extern "C" void osPfsDeleteFile_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    ctx->r2 = 1; // PFS_ERR_NOPACK
++    int channel = pfs_channel(rdram, ctx->r4);
++    if (channel < 0) { ctx->r2 = PFS_ERR_NOPACK; return; }
++    uint16_t company = (uint16_t)ctx->r5;
++    uint32_t game = (uint32_t)ctx->r6;
++    if (company == 0 || game == 0) { ctx->r2 = PFS_ERR_INVALID; return; }
++
++    std::lock_guard lock{ pak_mutex };
++    Pak& pak = load(channel);
++    int file_no = find_file(rdram, pak, company, game, ctx->r7, (gpr)MEM_W(0x10, ctx->r29));
++    if (file_no < 0) { ctx->r2 = PFS_ERR_INVALID; return; }
++
++    uint8_t* e = dir_entry(pak, file_no);
++    free_chain(pak, get16(&e[6]) & 0xFF);
++    memset(e, 0, dir_entry_size);
++    finish_inode_table(pak);
++    store(channel);
++    ctx->r2 = 0;
+ }
+ 
++// osPfsFileState(pfs, file_no, OSPfsState* state)
+ extern "C" void osPfsFileState_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    ctx->r2 = 1; // PFS_ERR_NOPACK
++    int channel = pfs_channel(rdram, ctx->r4);
++    if (channel < 0) { ctx->r2 = PFS_ERR_NOPACK; return; }
++    int file_no = (int)ctx->r5;
++    gpr state = ctx->r6;
++    if (file_no < 0 || file_no >= dir_entries) { ctx->r2 = PFS_ERR_INVALID; return; }
++
++    std::lock_guard lock{ pak_mutex };
++    Pak& pak = load(channel);
++    const uint8_t* e = dir_entry(pak, file_no);
++    if (!entry_used(e)) { ctx->r2 = PFS_ERR_INVALID; return; }
++
++    MEM_W(0x00, state) = count_pages(pak, get16(&e[6]) & 0xFF) * page_size;
++    MEM_W(0x04, state) = (int32_t)get32(&e[0]);
++    MEM_HU(0x08, state) = get16(&e[4]);
++    for (int j = 0; j < 4; j++) MEM_BU(0x0A + j, state) = e[12 + j];
++    for (int j = 0; j < 16; j++) MEM_BU(0x0E + j, state) = e[16 + j];
++    ctx->r2 = 0;
+ }
+ 
++// osPfsFindFile(pfs, company_code, game_code, game_name, ext_name, s32* file_no)
+ extern "C" void osPfsFindFile_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    ctx->r2 = 1; // PFS_ERR_NOPACK
++    int channel = pfs_channel(rdram, ctx->r4);
++    if (channel < 0) { ctx->r2 = PFS_ERR_NOPACK; return; }
++
++    std::lock_guard lock{ pak_mutex };
++    int file_no = find_file(rdram, load(channel), (uint16_t)ctx->r5, (uint32_t)ctx->r6, ctx->r7, (gpr)MEM_W(0x10, ctx->r29));
++    if (file_no < 0) { ctx->r2 = PFS_ERR_INVALID; return; }
++    MEM_W(0, (gpr)MEM_W(0x14, ctx->r29)) = file_no;
++    ctx->r2 = 0;
+ }
+ 
++// osPfsReadWriteFile(pfs, file_no, flag, offset, size_in_bytes, data_buffer)
+ extern "C" void osPfsReadWriteFile_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    ctx->r2 = 1; // PFS_ERR_NOPACK
++    int channel = pfs_channel(rdram, ctx->r4);
++    if (channel < 0) { ctx->r2 = PFS_ERR_NOPACK; return; }
++    int file_no = (int)ctx->r5;
++    bool write = ((uint8_t)ctx->r6) == 1; // PFS_WRITE
++    int32_t offset = (int32_t)ctx->r7;
++    int32_t size = MEM_W(0x10, ctx->r29);
++    gpr buffer = (gpr)MEM_W(0x14, ctx->r29);
++
++    if (file_no < 0 || file_no >= dir_entries || offset < 0 || size < 0 || (offset & 0x1F) || (size & 0x1F)) {
++        ctx->r2 = PFS_ERR_INVALID;
++        return;
++    }
++
++    std::lock_guard lock{ pak_mutex };
++    Pak& pak = load(channel);
++    const uint8_t* e = dir_entry(pak, file_no);
++    if (!entry_used(e)) { ctx->r2 = PFS_ERR_INVALID; return; }
++    int start = get16(&e[6]) & 0xFF;
++    if (offset + size > count_pages(pak, start) * page_size) { ctx->r2 = PFS_ERR_INVALID; return; }
++
++    // Walk to the page holding `offset`, then copy page by page along the chain.
++    int page = start;
++    for (int skip = offset / page_size; skip > 0; skip--) {
++        page = get16(inode(pak, page)) & 0xFF;
++    }
++    int in_page = offset % page_size;
++    for (int32_t done = 0; done < size; ) {
++        int chunk = std::min<int32_t>(page_size - in_page, size - done);
++        uint8_t* p = &pak.data[page * page_size + in_page];
++        for (int i = 0; i < chunk; i++) {
++            if (write) {
++                p[i] = MEM_BU(done + i, buffer);
++            } else {
++                MEM_BU(done + i, buffer) = p[i];
++            }
++        }
++        done += chunk;
++        in_page = 0;
++        if (done < size) {
++            page = get16(inode(pak, page)) & 0xFF;
++        }
++    }
++
++    if (write) {
++        store(channel);
++    }
++    ctx->r2 = 0;
+ }
+ 
+ extern "C" void osPfsChecker_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    ctx->r2 = 1; // PFS_ERR_NOPACK
++    ctx->r2 = 0;
+ }
+ 
++// osPfsNumFiles(pfs, s32* max_files, s32* files_used)
+ extern "C" void osPfsNumFiles_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    s32* max_files = _arg<1, s32*>(rdram, ctx);
+-    s32* files_used = _arg<2, s32*>(rdram, ctx);
+-
+-    *max_files = 0;
+-    *files_used = 0;
+-
+-    _return<s32>(ctx, 1); // PFS_ERR_NOPACK
++    int channel = pfs_channel(rdram, ctx->r4);
++    if (channel < 0) { ctx->r2 = PFS_ERR_NOPACK; return; }
++    std::lock_guard lock{ pak_mutex };
++    Pak& pak = load(channel);
++    int used = 0;
++    for (int i = 0; i < dir_entries; i++) {
++        used += entry_used(dir_entry(pak, i));
++    }
++    MEM_W(0, ctx->r5) = dir_entries;
++    MEM_W(0, ctx->r6) = used;
++    ctx->r2 = 0;
+ }
+ 
+ extern "C" void osPfsRepairId_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    _return<s32>(ctx, 1); // PFS_ERR_NOPACK
++    ctx->r2 = 0;
+ }
+diff --git a/librecomp/src/pi.cpp b/librecomp/src/pi.cpp
+index d7ebd53..b378d4a 100644
+--- a/librecomp/src/pi.cpp
++++ b/librecomp/src/pi.cpp
+@@ -26,6 +26,7 @@ std::span<const uint8_t> recomp::get_rom() {
+ }
+ 
+ constexpr uint32_t k1_to_phys(uint32_t addr) {
++    // PI bus addresses (cart ROM at 0x10000000, SRAM...), not rdram: always the full 29-bit physical mask.
+     return addr & 0x1FFFFFFF;
+ }
+ 
+diff --git a/librecomp/src/rsp.cpp b/librecomp/src/rsp.cpp
+index 1cb3f6a..a0f3ef2 100644
+--- a/librecomp/src/rsp.cpp
++++ b/librecomp/src/rsp.cpp
+@@ -10,7 +10,8 @@ void recomp::rsp::set_callbacks(const callbacks_t& callbacks) {
+     rsp_callbacks = callbacks;
+ }
+ 
+-uint8_t dmem[0x1000];
++// 16-byte aligned: the vector-unit fast paths (rsp_vu_impl.hpp) read and write it a word at a time.
++alignas(16) uint8_t dmem[0x1000];
+ uint16_t rspReciprocals[512];
+ uint16_t rspInverseSquareRoots[512];
+ 
+diff --git a/librecomp/src/sp.cpp b/librecomp/src/sp.cpp
+index ae0f44f..f3ab64f 100644
+--- a/librecomp/src/sp.cpp
++++ b/librecomp/src/sp.cpp
+@@ -37,12 +37,16 @@ extern "C" void osSpTaskStartGo_recomp(uint8_t* rdram, recomp_context* ctx) {
+ }
+ 
+ extern "C" void osSpTaskYield_recomp(uint8_t* rdram, recomp_context* ctx) {
+-    // Ignore yield requests (acts as if the task completed before it received the yield request)
++    // The gfx task in flight reports a yield at once; the renderer keeps running it (see ultramodern's events.cpp).
++    ultramodern::yield_rsp_task();
+ }
+ 
+ extern "C" void osSpTaskYielded_recomp(uint8_t* rdram, recomp_context* ctx) {
+-    // Task yield requests are ignored, so always return 0 as tasks will never be yielded
+-    ctx->r2 = 0;
++    OSTask* task = TO_PTR(OSTask, ctx->r4);
++    bool yielded = ultramodern::rsp_task_yielded(ctx->r4);
++    // As libultra: OS_TASK_YIELDED (0x1) in the task's flags follows the result.
++    if (yielded) task->t.flags |= 0x1; else task->t.flags &= ~0x1u;
++    ctx->r2 = yielded ? 1 : 0;
+ }
+ 
+ extern "C" void __osSpSetPc_recomp(uint8_t* rdram, recomp_context* ctx) {
+diff --git a/librecomp/src/ultra_translation.cpp b/librecomp/src/ultra_translation.cpp
+index e0d367e..a220f57 100644
+--- a/librecomp/src/ultra_translation.cpp
++++ b/librecomp/src/ultra_translation.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include <memory>
+ #include <ultramodern/ultra64.h>
+ #include <ultramodern/ultramodern.hpp>
+@@ -11,7 +12,10 @@ extern "C" void __osInitialize_common_recomp(uint8_t * rdram, recomp_context * c
+     osInitialize();
+ }
+ 
++extern "C" int32_t gauntlet_thread_stack(int32_t sp, int32_t id);
++
+ extern "C" void osCreateThread_recomp(uint8_t* rdram, recomp_context* ctx) {
++    MEM_W(0x10, ctx->r29) = gauntlet_thread_stack(MEM_W(0x10, ctx->r29), (int32_t)ctx->r5);
+     osCreateThread(rdram, (int32_t)ctx->r4, (OSId)ctx->r5, (int32_t)ctx->r6, (int32_t)ctx->r7,
+         (int32_t)MEM_W(0x10, ctx->r29), (OSPri)MEM_W(0x14, ctx->r29));
+ }
+@@ -28,9 +32,11 @@ extern "C" void osDestroyThread_recomp(uint8_t * rdram, recomp_context * ctx) {
+     osDestroyThread(rdram, (int32_t)ctx->r4);
+ }
+ 
++extern "C" void yield_self_1ms(uint8_t* rdram);
++
+ extern "C" void osYieldThread_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    assert(false);
+-    // osYieldThread(rdram);
++    // Gauntlet Legends yields inside polling loops; let pending events (VI, RSP, timers) run higher priority threads.
++    yield_self_1ms(rdram);
+ }
+ 
+ extern "C" void osSetThreadPri_recomp(uint8_t* rdram, recomp_context* ctx) {
+@@ -49,11 +55,16 @@ extern "C" void osCreateMesgQueue_recomp(uint8_t* rdram, recomp_context* ctx) {
+     osCreateMesgQueue(rdram, (int32_t)ctx->r4, (int32_t)ctx->r5, (s32)ctx->r6);
+ }
+ 
++extern "C" void gauntlet_trace_note(const char* what, uint32_t a, uint32_t b);
++
+ extern "C" void osRecvMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
++    gauntlet_trace_note("osRecvMesg", (uint32_t)ctx->r4, (uint32_t)ctx->r6);
+     ctx->r2 = osRecvMesg(rdram, (int32_t)ctx->r4, (int32_t)ctx->r5, (s32)ctx->r6);
++    gauntlet_trace_note("osRecvMesg-ret", (uint32_t)ctx->r4, (uint32_t)ctx->r2);
+ }
+ 
+ extern "C" void osSendMesg_recomp(uint8_t* rdram, recomp_context* ctx) {
++    gauntlet_trace_note("osSendMesg", (uint32_t)ctx->r4, (uint32_t)ctx->r6);
+     ctx->r2 = osSendMesg(rdram, (int32_t)ctx->r4, (OSMesg)ctx->r5, (s32)ctx->r6);
+ }
+ 
+diff --git a/librecomp/src/vi.cpp b/librecomp/src/vi.cpp
+index 1f3a4cf..4fa9f87 100644
+--- a/librecomp/src/vi.cpp
++++ b/librecomp/src/vi.cpp
+@@ -34,7 +34,10 @@ extern "C" void osViGetNextFramebuffer_recomp(uint8_t* rdram, recomp_context* ct
+     ctx->r2 = (gpr)(int32_t)osViGetNextFramebuffer();
+ }
+ 
++extern "C" void gauntlet_trace_note(const char* what, uint32_t a, uint32_t b);
++
+ extern "C" void osViSwapBuffer_recomp(uint8_t* rdram, recomp_context* ctx) {
++    gauntlet_trace_note("osViSwapBuffer", (uint32_t)ctx->r4, 0);
+     osViSwapBuffer(rdram, (int32_t)ctx->r4);
+ }
+ 
+diff --git a/thirdparty/concurrentqueue/lightweightsemaphore.h b/thirdparty/concurrentqueue/lightweightsemaphore.h
+index 41ba094..1ea9fe0 100644
+--- a/thirdparty/concurrentqueue/lightweightsemaphore.h
++++ b/thirdparty/concurrentqueue/lightweightsemaphore.h
+@@ -24,6 +24,8 @@ extern "C" {
+ }
+ #elif defined(__MACH__)
+ #include <mach/mach.h>
++#elif defined(__vita__)
++#include <psp2/kernel/threadmgr.h>
+ #elif defined(__unix__)
+ #include <semaphore.h>
+ 
+@@ -165,6 +167,58 @@ public:
+ 		}
+ 	}
+ };
++#elif defined(__vita__)
++//---------------------------------------------------------
++// Semaphore (PS Vita kernel semaphore). pthread-embedded's POSIX sem_wait can return
++// without the semaphore having been signalled, which let two scheduler-owned threads run at once.
++//---------------------------------------------------------
++class Semaphore
++{
++private:
++	SceUID m_sema;
++
++	Semaphore(const Semaphore& other) MOODYCAMEL_DELETE_FUNCTION;
++	Semaphore& operator=(const Semaphore& other) MOODYCAMEL_DELETE_FUNCTION;
++
++public:
++	Semaphore(int initialCount = 0)
++	{
++		assert(initialCount >= 0);
++		m_sema = sceKernelCreateSema("mc_sema", 0, initialCount, 0x7FFFFFFF, nullptr);
++		assert(m_sema >= 0);
++	}
++
++	~Semaphore()
++	{
++		sceKernelDeleteSema(m_sema);
++	}
++
++	bool wait()
++	{
++		return sceKernelWaitSema(m_sema, 1, nullptr) == 0;
++	}
++
++	bool try_wait()
++	{
++		return sceKernelPollSema(m_sema, 1) == 0;
++	}
++
++	bool timed_wait(std::uint64_t usecs)
++	{
++		SceUInt timeout = usecs > 0xFFFFFFFFull ? 0xFFFFFFFFu : (SceUInt)usecs;
++		return sceKernelWaitSema(m_sema, 1, &timeout) == 0;
++	}
++
++	void signal()
++	{
++		sceKernelSignalSema(m_sema, 1);
++	}
++
++	void signal(int count)
++	{
++		if (count > 0) sceKernelSignalSema(m_sema, count);
++	}
++};
+ #elif defined(__unix__)
+ //---------------------------------------------------------
+ // Semaphore (POSIX, Linux)
+diff --git a/ultramodern/include/ultramodern/input.hpp b/ultramodern/include/ultramodern/input.hpp
+index 1dab1b8..0e7866f 100644
+--- a/ultramodern/include/ultramodern/input.hpp
++++ b/ultramodern/include/ultramodern/input.hpp
+@@ -15,7 +15,7 @@ namespace ultramodern {
+         enum class Pak {
+             None,
+             RumblePak,
+-            // ControllerPak,
++            ControllerPak,
+             // TransferPak
+         };
+ 
+diff --git a/ultramodern/include/ultramodern/renderer_context.hpp b/ultramodern/include/ultramodern/renderer_context.hpp
+index 43032ea..26b59fa 100644
+--- a/ultramodern/include/ultramodern/renderer_context.hpp
++++ b/ultramodern/include/ultramodern/renderer_context.hpp
+@@ -62,6 +62,12 @@ namespace ultramodern {
+             void* view;
+             auto operator<=>(const WindowHandle&) const = default;
+         };
++#elif defined(__vita__)
++        // The Vita renderer owns the display itself; the handle is unused.
++        struct WindowHandle {
++            void* unused = nullptr;
++            auto operator<=>(const WindowHandle&) const = default;
++        };
+ #endif
+ 
+         enum class SetupResult {
+diff --git a/ultramodern/include/ultramodern/ultra64.h b/ultramodern/include/ultramodern/ultra64.h
+index 31eb106..dc940f5 100644
+--- a/ultramodern/include/ultramodern/ultra64.h
++++ b/ultramodern/include/ultramodern/ultra64.h
+@@ -39,7 +39,10 @@ typedef uint8_t u8;
+ #  define RDRAM_ARG1 uint8_t *rdram
+ #  define PASS_RDRAM rdram, 
+ #  define PASS_RDRAM1 rdram
+-#  define TO_PTR(type, var) ((type*)(&rdram[(uint64_t)var - 0xFFFFFFFF80000000]))
++#  ifndef RDRAM_MASK
++#    define RDRAM_MASK 0x1FFFFFFF
++#  endif
++#  define TO_PTR(type, var) ((type*)(&rdram[(uint64_t)var & RDRAM_MASK]))
+ #  define GET_MEMBER(type, addr, member) (addr + (intptr_t)&(((type*)nullptr)->member))
+ #  ifdef __cplusplus
+ #    define NULLPTR (PTR(void))0
+diff --git a/ultramodern/include/ultramodern/ultramodern.hpp b/ultramodern/include/ultramodern/ultramodern.hpp
+index db45ee4..647614d 100644
+--- a/ultramodern/include/ultramodern/ultramodern.hpp
++++ b/ultramodern/include/ultramodern/ultramodern.hpp
+@@ -77,6 +77,9 @@ PTR(OSThread) this_thread();
+ void set_main_thread();
+ bool is_game_thread();
+ void submit_rsp_task(RDRAM_ARG PTR(OSTask) task);
++// osSpTaskYield / osSpTaskYielded for the gfx task in flight (see events.cpp).
++void yield_rsp_task();
++bool rsp_task_yielded(PTR(OSTask) task);
+ void send_si_message(RDRAM_ARG1);
+ uint32_t get_speed_multiplier();
+ 
+@@ -98,6 +101,8 @@ void init_audio();
+ void set_audio_frequency(uint32_t freq);
+ void queue_audio_buffer(RDRAM_ARG PTR(s16) audio_data, uint32_t byte_count);
+ uint32_t get_remaining_audio_bytes();
++uint32_t get_audio_low_water_bytes();
++void ai_buffer_queued();
+ 
+ struct audio_callbacks_t {
+     using queue_samples_t = void(int16_t*, size_t);
+@@ -151,7 +156,14 @@ void set_callbacks(
+ 
+ #define MIN(a, b) ((a) < (b) ? (a) : (b))
+ 
++#if defined(ULTRAMODERN_DEBUG_PRINTF) && defined(__vita__)
++// Vita: buffered in memory by the frontend and written out on abort.
++extern "C" void ultramodern_debug_printf(const char* fmt, ...);
++#define debug_printf(...) ultramodern_debug_printf(__VA_ARGS__);
++#elif defined(ULTRAMODERN_DEBUG_PRINTF)
++#define debug_printf(...) printf(__VA_ARGS__);
++#else
+ #define debug_printf(...)
+-//#define debug_printf(...) printf(__VA_ARGS__);
++#endif
+ 
+ #endif
+diff --git a/ultramodern/src/audio.cpp b/ultramodern/src/audio.cpp
+index 3198be0..d9de2fa 100644
+--- a/ultramodern/src/audio.cpp
++++ b/ultramodern/src/audio.cpp
+@@ -33,6 +33,12 @@ void ultramodern::queue_audio_buffer(RDRAM_ARG PTR(int16_t) audio_data_, uint32_
+     if (sample_count > 0 && audio_callbacks.queue_samples) {
+         audio_callbacks.queue_samples(TO_PTR(int16_t, audio_data_), sample_count);
+     }
++    ultramodern::ai_buffer_queued();
++}
++
++// The AI thread raises an AI interrupt once the reported remaining audio drops to this (one VI's worth of samples).
++uint32_t ultramodern::get_audio_low_water_bytes() {
++    return (sample_rate / 60) * 2 * sizeof(int16_t);
+ }
+ 
+ // For SDL2
+diff --git a/ultramodern/src/error_handling.cpp b/ultramodern/src/error_handling.cpp
+index 8ca779e..1e250b8 100644
+--- a/ultramodern/src/error_handling.cpp
++++ b/ultramodern/src/error_handling.cpp
+@@ -21,7 +21,7 @@ void ultramodern::error_handling::message_box(const char* msg) {
+ void ultramodern::error_handling::quick_exit(const char* filename, int line, const char *func, int exit_status) {
+     fprintf(stderr, "Exiting with exit status '%i'. Function %s, at file %s:%i\n", exit_status, func, filename, line);
+ 
+-#ifdef __APPLE__
++#if defined(__APPLE__) || defined(__vita__)
+     std::_Exit(exit_status);
+ #else
+     std::quick_exit(exit_status);
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index 46f63f1..ec43512 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -67,6 +67,13 @@ static struct {
+         void update_vi() {
+             ViState* next_state = get_next_state();
+             const OSViMode* next_mode = next_state->mode;
++            if (next_mode == nullptr) {
++                // No osViSetMode yet (Gauntlet sets its mode later than the VI thread starts):
++                // leave the registers alone but still swap states so osViSetEvent takes effect.
++                cur_state ^= 1;
++                *get_next_state() = *get_cur_state();
++                return;
++            }
+             const OSViCommonRegs* common_regs = &next_mode->comRegs;
+             const OSViFieldRegs* field_regs = &next_mode->fldRegs[field];
+             PTR(void) framebuffer = osVirtualToPhysical(next_state->framebuffer);
+@@ -117,6 +124,7 @@ static struct {
+         OSMesg msg = (OSMesg)0;
+     } dp;
+     struct {
++        std::thread thread;
+         PTR(OSMesgQueue) mq = NULLPTR;
+         OSMesg msg = (OSMesg)0;
+     } ai;
+@@ -174,6 +182,30 @@ extern moodycamel::LightweightSemaphore graphics_shutdown_ready;
+ 
+ void set_dummy_vi(bool odd);
+ 
++// Screen updates queued by the VI thread and not yet handled by the gfx thread. A present that waits for vsync takes
++// about one VI period, so after any slow moment (texture uploads, a GPU stall) the queue never drains and display lists
++// queued behind the screen updates wait seconds for the gfx thread (the Vita froze the game this way). Stale updates
++// are skipped instead of presented.
++static std::atomic<int> pending_screen_updates{ 0 };
++bool ultramodern_early_sp_complete = false;
++std::atomic<uint32_t> ultramodern_skipped_presents{ 0 };
++
++// Gfx task yields. The game's scheduler (libultra osSched) yields the gfx task when an audio task is ready, then
++// restarts it once the audio task is done. Upstream ignores yields, so a long render holds the audio task back (on the
++// Vita audio then ran at the frame rate, ~35 tasks/s in heavy scenes, and played choppy). Here a yield reports the RSP
++// as yielded at once while the renderer keeps going; the game sees the task as unfinished, so unlike reporting it done
++// early it leaves the task's display list and buffers alone. The restart is not rendered again: the task completes
++// when the render has ended and the game has restarted it, whichever comes last.
++static std::mutex gfx_yield_mutex;
++static PTR(OSTask) gfx_inflight = NULLPTR; // submitted, completion not yet reported
++static bool gfx_inflight_yieldable = false;
++static bool gfx_yielded = false;  // reported as yielded and not yet restarted
++static bool gfx_finished = false; // the render ended while yielded
++std::atomic<uint32_t> ultramodern_gfx_yields{ 0 };
++// SP task thread markers, so that these messages come from a native thread like the other RSP messages.
++static OSTask* const sp_yield_marker = reinterpret_cast<OSTask*>(uintptr_t{ 1 });
++static OSTask* const sp_gfx_done_marker = reinterpret_cast<OSTask*>(uintptr_t{ 2 });
++
+ void vi_thread_func() {
+     ultramodern::set_native_thread_name("VI Thread");
+     // This thread should be prioritized over every other thread in the application, as it's what allows
+@@ -217,6 +249,7 @@ void vi_thread_func() {
+ 
+         // Queue a screen update for the graphics thread with the current VI register state.
+         // Doing this before the VI update is equivalent to updating the screen after the previous frame's scanout finished.
++        pending_screen_updates++;
+         events_context.action_queue.enqueue(ScreenUpdateAction{ events_context.vi.regs });
+ 
+         // Update VI registers and swap VI modes.
+@@ -237,11 +270,6 @@ void vi_thread_func() {
+                 }
+                 remaining_retraces = cur_state->retrace_count;
+             }
+-            if (events_context.ai.mq != NULLPTR) {
+-                if (osSendMesg(PASS_RDRAM events_context.ai.mq, events_context.ai.msg, OS_MESG_NOBLOCK) == -1) {
+-                    //printf("Game skipped a AI frame!\n");
+-                }
+-            }
+         }
+ 
+         if (events_callbacks.vi_callback != nullptr) {
+@@ -250,6 +278,44 @@ void vi_thread_func() {
+     }
+ }
+ 
++// AI interrupts. On the console one fires each time a queued buffer starts playing, and Gauntlet Legends' MusyX driver
++// produces exactly one fixed-size buffer (192 samples) per interrupt. Sending one per VI starves it (~11.5k of 22.05k
++// samples/s), so instead send one whenever the output has run low, and wait for the game's next buffer before sending
++// another. A timeout keeps the interrupt flowing if the game doesn't answer one.
++static std::atomic_bool ai_awaiting_buffer{ false };
++
++void ultramodern::ai_buffer_queued() {
++    ai_awaiting_buffer = false;
++}
++
++void ai_thread_func() {
++    ultramodern::set_native_thread_name("AI Thread");
++    ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::Critical);
++    using namespace std::chrono_literals;
++    auto sent_time = std::chrono::high_resolution_clock::now();
++
++    while (!exited) {
++        std::this_thread::sleep_for(1ms);
++        if (!ultramodern::is_game_started()) {
++            continue;
++        }
++        auto now = std::chrono::high_resolution_clock::now();
++        if (ai_awaiting_buffer && now - sent_time < 50ms) {
++            continue;
++        }
++        if (ultramodern::get_remaining_audio_bytes() > ultramodern::get_audio_low_water_bytes()) {
++            continue;
++        }
++        uint8_t* rdram = events_context.rdram;
++        std::lock_guard lock{ events_context.message_mutex };
++        if (events_context.ai.mq != NULLPTR) {
++            ai_awaiting_buffer = true;
++            sent_time = now;
++            osSendMesg(PASS_RDRAM events_context.ai.mq, events_context.ai.msg, OS_MESG_NOBLOCK);
++        }
++    }
++}
++
+ void sp_complete() {
+     uint8_t* rdram = events_context.rdram;
+     std::lock_guard lock{ events_context.message_mutex };
+@@ -278,6 +344,16 @@ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_r
+             return;
+         }
+ 
++        if (task == sp_yield_marker) {
++            sp_complete();
++            continue;
++        }
++        if (task == sp_gfx_done_marker) {
++            sp_complete();
++            dp_complete();
++            continue;
++        }
++
+         if (!ultramodern::rsp::run_task(PASS_RDRAM task)) {
+             fprintf(stderr, "Failed to execute task type: %" PRIu32 "\n", task->t.type);
+             ULTRAMODERN_QUICK_EXIT();
+@@ -359,21 +435,41 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+                     renderer_context->enable_instant_present();
+                     enabled_instant_present = true;
+                 }
+-                // Tell the game that the RSP completed instantly. This will allow it to queue other task types, but it won't
+-                // start another graphics task until the RDP is also complete. Games usually preserve the RSP inputs until the RDP
+-                // is finished as well, so sending this early shouldn't be an issue in most cases.
+-                // If this causes issues then the logic can be replaced with responding to yield requests.
+-                sp_complete();
+                 ultramodern::measure_input_latency();
+ 
+                 [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
++                // Vita: report the RSP done before rendering, as on the console (the RDP draws after the RSP has
++                // run the list), so the game can build its next frame while this one renders; DP done still follows
++                // the render.
++                if (ultramodern_early_sp_complete) sp_complete();
+                 renderer_context->send_dl(&task_action->task);
+                 [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
+-                dp_complete();
++                // Gauntlet: report the RSP as done only after the renderer has run the list. Upstream sends this before
++                // send_dl, which lets the game rebuild its HUD buffer in RDRAM (CPU blits mixed with RDP-drawn bar
++                // segments that RT64 writes back during send_dl) while the renderer is still reading and writing it;
++                // the HUD then broke over time (panels in the wrong slot, black panels with stray pixels).
++                bool report = true;
++                {
++                    std::lock_guard lock{ gfx_yield_mutex };
++                    if (gfx_yielded) {
++                        gfx_finished = true; // completes on the restart
++                        report = false;
++                    } else {
++                        gfx_inflight = NULLPTR;
++                    }
++                }
++                if (report) {
++                    if (!ultramodern_early_sp_complete) sp_complete();
++                    dp_complete();
++                }
+                 // printf("Renderer ProcessDList time: %d us\n", static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count()));
+             }
+             else if (const auto* screen_update_action = std::get_if<ScreenUpdateAction>(&action)) {
+                 events_context.vi.update_screen_regs = screen_update_action->regs;
++                if (--pending_screen_updates > 0) {
++                    ultramodern_skipped_presents++;
++                    continue;
++                }
+                 renderer_context->update_screen();
+                 display_refresh_rate = renderer_context->get_display_framerate();
+                 resolution_scale = renderer_context->get_resolution_scale();
+@@ -551,6 +647,24 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
+ 
+     // Send gfx tasks to the graphics action queue
+     if (task->t.type == M_GFXTASK) {
++        std::lock_guard lock{ gfx_yield_mutex };
++        if (gfx_yielded && task_ == gfx_inflight) {
++            // Restart of the yielded task: the renderer never stopped running it.
++            gfx_yielded = false;
++            if (gfx_finished) {
++                gfx_finished = false;
++                gfx_inflight = NULLPTR;
++                events_context.sp_task_queue.enqueue(sp_gfx_done_marker);
++            }
++            return;
++        }
++        // Only an osSched XBUS task (OSScTask flags, just before its OSTask, & 7 == 3) is put back on the gfx list
++        // after a yield; for any other kind a yield would lose the task, so it is never reported.
++        uint32_t sc_flags = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(task) - 8);
++        gfx_inflight = task_;
++        gfx_inflight_yieldable = !ultramodern_early_sp_complete && (sc_flags & 7) == 3;
++        gfx_yielded = false;
++        gfx_finished = false;
+         events_context.action_queue.enqueue(SpTaskAction{ *task });
+     }
+     // Set all other tasks as the RSP task
+@@ -559,6 +673,22 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
+     }
+ }
+ 
++void ultramodern::yield_rsp_task() {
++    std::lock_guard lock{ gfx_yield_mutex };
++    // Nothing to yield once the render has been reported done; the scheduler then sees an unyielded completion.
++    if (gfx_inflight == NULLPTR || !gfx_inflight_yieldable || gfx_yielded) {
++        return;
++    }
++    gfx_yielded = true;
++    ultramodern_gfx_yields++;
++    events_context.sp_task_queue.enqueue(sp_yield_marker);
++}
++
++bool ultramodern::rsp_task_yielded(PTR(OSTask) task) {
++    std::lock_guard lock{ gfx_yield_mutex };
++    return gfx_yielded && task == gfx_inflight;
++}
++
+ void ultramodern::send_si_message(RDRAM_ARG1) {
+     osSendMesg(PASS_RDRAM events_context.si.mq, events_context.si.msg, OS_MESG_NOBLOCK);
+ }
+@@ -604,11 +734,13 @@ void ultramodern::init_events(RDRAM_ARG ultramodern::renderer::WindowHandle wind
+     }
+ 
+     events_context.vi.thread = std::thread{ vi_thread_func };
++    events_context.ai.thread = std::thread{ ai_thread_func };
+ }
+ 
+ void ultramodern::join_event_threads() {
+     events_context.sp.gfx_thread.join();
+     events_context.vi.thread.join();
++    events_context.ai.thread.join();
+ 
+     // Send a null RSP task to indicate that the RSP task thread should exit.
+     events_context.sp_task_queue.enqueue(nullptr);
+diff --git a/ultramodern/src/input.cpp b/ultramodern/src/input.cpp
+index 03a7c6b..830be5f 100644
+--- a/ultramodern/src/input.cpp
++++ b/ultramodern/src/input.cpp
+@@ -71,7 +71,7 @@ static void __osContGetInitData(u8* pattern, OSContStatus *data) {
+             data[controller].status = device_info.connected_pak != ultramodern::input::Pak::None;
+             data[controller].err_no = 0x00;
+ 
+-            *pattern = 1 << controller;
++            *pattern |= 1 << controller;
+         }
+         else {
+             // Mark controller as not connected
+diff --git a/ultramodern/src/mesgqueue.cpp b/ultramodern/src/mesgqueue.cpp
+index 6f38e02..96a1188 100644
+--- a/ultramodern/src/mesgqueue.cpp
++++ b/ultramodern/src/mesgqueue.cpp
+@@ -1,4 +1,6 @@
++#include <cstdio>
+ #include <thread>
++#include <atomic>
+ 
+ #include "blockingconcurrentqueue.h"
+ 
+@@ -19,23 +21,36 @@ void enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam) {
+ 
+ bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
+ 
++// Interrupt-style messages that found their queue full and were dropped (debug stat: count, last queue, last message).
++std::atomic<uint32_t> ultramodern_dropped_messages{ 0 };
++std::atomic<uint32_t> ultramodern_dropped_last_mq{ 0 };
++std::atomic<uint32_t> ultramodern_dropped_last_msg{ 0 };
++
++static void send_external(RDRAM_ARG const QueuedMessage& m) {
++    if (!do_send(PASS_RDRAM m.mq, m.mesg, m.jam, false)) {
++        ultramodern_dropped_messages++;
++        ultramodern_dropped_last_mq = (uint32_t)m.mq;
++        ultramodern_dropped_last_msg = (uint32_t)m.mesg;
++    }
++}
++
+ void dequeue_external_messages(RDRAM_ARG1) {
+     QueuedMessage to_send;
+     while (external_messages.try_dequeue(to_send)) {
+-        do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false);
++        send_external(PASS_RDRAM to_send);
+     }
+ }
+ 
+ void ultramodern::wait_for_external_message(RDRAM_ARG1) {
+     QueuedMessage to_send;
+     external_messages.wait_dequeue(to_send);
+-    do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false);
++    send_external(PASS_RDRAM to_send);
+ }
+ 
+ void ultramodern::wait_for_external_message_timed(RDRAM_ARG1, u32 millis) {
+     QueuedMessage to_send;
+     if (external_messages.wait_dequeue_timed(to_send, std::chrono::milliseconds{millis})) {
+-        do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false);
++        send_external(PASS_RDRAM to_send);
+     }
+ }
+ 
+diff --git a/ultramodern/src/misc_ultra.cpp b/ultramodern/src/misc_ultra.cpp
+index 31fb226..397d19c 100644
+--- a/ultramodern/src/misc_ultra.cpp
++++ b/ultramodern/src/misc_ultra.cpp
+@@ -15,8 +15,8 @@ u32 osVirtualToPhysical(PTR(void) addr) {
+     } else if (IS_KSEG1(addr_val)) {
+         return K1_TO_PHYS(addr_val);
+     } else {
+-        // TODO handle TLB mappings
+-        return (u32)addr_val;
++        // Gauntlet Legends: TLB-mapped kseg3 code/data (0xE0xxxxxx) lives at its physical alias addr & 0x1FFFFFFF
++        return (u32)addr_val & 0x1FFFFFFF;
+     }
+ }
+ 
+diff --git a/ultramodern/src/threads.cpp b/ultramodern/src/threads.cpp
+index 812c556..d8e91e2 100644
+--- a/ultramodern/src/threads.cpp
++++ b/ultramodern/src/threads.cpp
+@@ -143,6 +143,13 @@ void ultramodern::set_native_thread_name(const std::string& name) {
+     pthread_setname_np(name.c_str());
+ }
+ 
++void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
++#elif defined(__vita__)
++// Pinning threads to cores was tried (game / renderer / VI+RSP on cores 0 / 1 / 2): presents then waited ~10x longer
++// in Vita3K, so the threads keep the default affinity.
++// Names are recorded for the per-thread CPU line in perf.txt (main_vita.cpp).
++void vita_register_thread(const char* name);
++void ultramodern::set_native_thread_name(const std::string& name) { vita_register_thread(name.c_str()); }
+ void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
+ #endif
+ 

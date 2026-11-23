@@ -1,0 +1,118 @@
+diff --git a/include/recomp.h b/include/recomp.h
+index 73f3e73..96a89f9 100644
+--- a/include/recomp.h
++++ b/include/recomp.h
+@@ -67,7 +67,29 @@ static inline void DMULTU(uint64_t a, uint64_t b, uint64_t* lo64, uint64_t* hi64
+ }
+ 
+ #else
+-#error "128-bit integer type not found"
++
++// No 128-bit type (32-bit targets such as the PS Vita): build the product from 32-bit halves.
++static inline void DMULTU(uint64_t a, uint64_t b, uint64_t* lo64, uint64_t* hi64) {
++    uint64_t a_lo = (uint32_t)a, a_hi = a >> 32;
++    uint64_t b_lo = (uint32_t)b, b_hi = b >> 32;
++    uint64_t p0 = a_lo * b_lo;
++    uint64_t p1 = a_lo * b_hi;
++    uint64_t p2 = a_hi * b_lo;
++    uint64_t p3 = a_hi * b_hi;
++    uint64_t mid = (p0 >> 32) + (uint32_t)p1 + (uint32_t)p2;
++    *lo64 = (mid << 32) | (uint32_t)p0;
++    *hi64 = p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32);
++}
++
++static inline void DMULT(int64_t a, int64_t b, int64_t* lo64, int64_t* hi64) {
++    uint64_t lo, hi;
++    DMULTU((uint64_t)a, (uint64_t)b, &lo, &hi);
++    if (a < 0) hi -= (uint64_t)b;
++    if (b < 0) hi -= (uint64_t)a;
++    *lo64 = (int64_t)lo;
++    *hi64 = (int64_t)hi;
++}
++
+ #endif
+ 
+ static inline void DDIV(int64_t a, int64_t b, int64_t* quot, int64_t* rem) {
+@@ -92,24 +114,30 @@ typedef uint64_t gpr;
+ #define SUB32(a, b) \
+     ((gpr)(int32_t)((a) - (b)))
+ 
++#ifndef RDRAM_MASK
++// Physical address mask for rdram accesses. The PC build reserves the whole 512 MB KSEG0 range; the Vita build
++// sets a smaller mask (Gauntlet only uses the low 16 MB) through a compile definition.
++#define RDRAM_MASK 0x1FFFFFFF
++#endif
++
+ #define MEM_W(offset, reg) \
+-    (*(int32_t*)(rdram + ((((reg) + (offset))) - 0xFFFFFFFF80000000)))
++    (*(int32_t*)(rdram + ((((reg) + (offset))) & RDRAM_MASK)))
+ 
+ #define MEM_H(offset, reg) \
+-    (*(int16_t*)(rdram + ((((reg) + (offset)) ^ 2) - 0xFFFFFFFF80000000)))
++    (*(int16_t*)(rdram + ((((reg) + (offset)) ^ 2) & RDRAM_MASK)))
+ 
+ #define MEM_B(offset, reg) \
+-    (*(int8_t*)(rdram + ((((reg) + (offset)) ^ 3) - 0xFFFFFFFF80000000)))
++    (*(int8_t*)(rdram + ((((reg) + (offset)) ^ 3) & RDRAM_MASK)))
+ 
+ #define MEM_HU(offset, reg) \
+-    (*(uint16_t*)(rdram + ((((reg) + (offset)) ^ 2) - 0xFFFFFFFF80000000)))
++    (*(uint16_t*)(rdram + ((((reg) + (offset)) ^ 2) & RDRAM_MASK)))
+ 
+ #define MEM_BU(offset, reg) \
+-    (*(uint8_t*)(rdram + ((((reg) + (offset)) ^ 3) - 0xFFFFFFFF80000000)))
++    (*(uint8_t*)(rdram + ((((reg) + (offset)) ^ 3) & RDRAM_MASK)))
+ 
+ #define SD(val, offset, reg) { \
+-    *(uint32_t*)(rdram + ((((reg) + (offset) + 4)) - 0xFFFFFFFF80000000)) = (uint32_t)((gpr)(val) >> 0); \
+-    *(uint32_t*)(rdram + ((((reg) + (offset) + 0)) - 0xFFFFFFFF80000000)) = (uint32_t)((gpr)(val) >> 32); \
++    *(uint32_t*)(rdram + ((((reg) + (offset) + 4)) & RDRAM_MASK)) = (uint32_t)((gpr)(val) >> 0); \
++    *(uint32_t*)(rdram + ((((reg) + (offset) + 0)) & RDRAM_MASK)) = (uint32_t)((gpr)(val) >> 32); \
+ }
+ 
+ static inline uint64_t load_doubleword(uint8_t* rdram, gpr reg, gpr offset) {
+@@ -347,11 +375,24 @@ static inline void set_cop1_cs(uint32_t val) {
+ #define CVT_S_D(val) \
+     ((float)(val))
+ 
++#ifdef __arm__
++// ARM float->int conversions saturate (and give 0 for NaN); the game was tuned against x86 behaviour (the PC port),
++// which gives 0x80000000 for anything out of range. Match it.
++static inline int32_t x86_f2i(double v) {
++    return (v > -2147483649.0 && v < 2147483648.0) ? (int32_t)v : INT32_MIN;
++}
++#define TRUNC_W_S(val) \
++    x86_f2i(val)
++
++#define TRUNC_W_D(val) \
++    x86_f2i(val)
++#else
+ #define TRUNC_W_S(val) \
+     ((int32_t)(val))
+ 
+ #define TRUNC_W_D(val) \
+     ((int32_t)(val))
++#endif
+ 
+ #define TRUNC_L_S(val) \
+     ((int64_t)(val))
+@@ -363,6 +404,9 @@ static inline void set_cop1_cs(uint32_t val) {
+ 
+ static inline int32_t do_cvt_w_s(float val) {
+     // Rounding mode aware float to 32-bit int conversion.
++#ifdef __arm__
++    if (!(val > -2147483649.0f && val < 2147483648.0f)) return INT32_MIN;
++#endif
+     return (int32_t)lrintf(val);
+ }
+ 
+@@ -379,6 +423,9 @@ static inline int64_t do_cvt_l_s(float val) {
+ 
+ static inline int32_t do_cvt_w_d(double val) {
+     // Rounding mode aware double to 32-bit int conversion.
++#ifdef __arm__
++    if (!(val > -2147483649.0 && val < 2147483648.0)) return INT32_MIN;
++#endif
+     return (int32_t)lrint(val);
+ }
+ 

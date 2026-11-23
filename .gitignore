@@ -1,0 +1,21 @@
+# Everything made from the ROM, downloaded or built on your PC -- never commit these
+/rom/
+/deps/
+/.venv/
+/logs/
+/recomp/RecompiledFuncs/
+/recomp/rsp/
+/recomp/gauntlet_code.bin
+/recomp/recomp.log
+/recomp/.recompiled
+/port/build/
+/vita/build/
+/vita/sce_sys/
+/vita/art_src/
+/vita_files/
+*.z64
+*.v64
+*.n64
+*.vpk
+*.mpk
+__pycache__/

@@ -30,6 +30,11 @@ that are already finished.
 After updating (a new ZIP over the old folder, or `git pull`), run `SETUP.bat` again. It re-applies changed
 patches and rebuilds what changed.
 
+### macOS and Linux
+
+There's no installer for macOS or Linux yet, but one can be made on request: open an issue saying which
+system you're on.
+
 ## Controls and saves
 
 Controllers work through SDL (Xbox, PlayStation, Switch Pro and others). Each controller connected is a

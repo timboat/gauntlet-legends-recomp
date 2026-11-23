@@ -159,6 +159,22 @@ def git(*args, cwd=None, check=True, quiet=False):
     return r
 
 
+def retry(action, cleanup=None, tries=4):
+    """Downloads from GitHub fail now and then (a dropped connection): wait and try again."""
+    import time
+    for n in range(1, tries + 1):
+        try:
+            return action()
+        except RuntimeError:
+            if n == tries:
+                raise RuntimeError('the download kept failing: check the internet connection and run the setup '
+                                   'again (it continues where it stopped)')
+            say(f'  the download failed; trying again in {15 * n} s ...')
+            if cleanup:
+                cleanup()
+            time.sleep(15 * n)
+
+
 def patch_key(repo):
     """What the patched checkout should be: the commit, the pins and the patches' contents."""
     h = hashlib.sha256(repo['commit'].encode())
@@ -179,13 +195,18 @@ def get_repo(repo):
         say(f'  deps\\{repo["name"]}: OK')
         return
     if not os.path.isdir(os.path.join(dest, '.git')):
+        # into <name>.part, renamed when complete; a download cut off part-way is picked up where it stopped
         part = dest + '.part'
-        shutil.rmtree(part, ignore_errors=True)
-        say(f'  downloading {repo["name"]} ({repo["url"]}) ...')
-        git('clone', '--quiet', repo['url'], part)
-        git('checkout', '--quiet', repo['commit'], cwd=part)
+        resumable = os.path.isdir(os.path.join(part, '.git')) and not git(
+            'rev-parse', '--verify', '--quiet', repo['commit'] + '^{commit}', cwd=part, check=False, quiet=True).returncode
+        if not resumable:
+            shutil.rmtree(part, ignore_errors=True)
+            say(f'  downloading {repo["name"]} ({repo["url"]}) ...')
+            retry(lambda: git('clone', '--quiet', repo['url'], part),
+                  lambda: shutil.rmtree(part, ignore_errors=True))
+        git('checkout', '--quiet', '--force', repo['commit'], cwd=part)
         say(f'  downloading {repo["name"]}\'s submodules ...')
-        git('submodule', 'update', '--quiet', '--init', '--recursive', cwd=part)
+        retry(lambda: git('submodule', 'update', '--quiet', '--init', '--recursive', cwd=part))
         os.replace(part, dest)
     else:
         # an earlier version of the patches (an update): back to the clean commit first

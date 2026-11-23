@@ -31,7 +31,7 @@ LLVM_VERSION = '23.1.4'
 LLVM_URL = ('https://github.com/llvm/llvm-project/releases/download/llvmorg-{v}/'
             'clang+llvm-{v}-x86_64-pc-windows-msvc.tar.zst')
 LLVM_SHA256 = '1a3f2f998e230b5791cc4e2bfe11a1f7c07fe42c96ff44f227c9db0bedfaf091'
-LLVM_TOOLS = ('clang-cl', 'lld-link', 'llvm-lib', 'llvm-rc', 'llvm-mt')
+LLVM_TOOLS = ('clang', 'clang-cl', 'lld-link', 'llvm-lib', 'llvm-rc', 'llvm-mt')   # RT64 runs plain clang on its shaders
 XWIN_DIR = os.path.join(ROOT, 'deps', 'xwin')
 XWIN_VERSION = '0.10.0'
 XWIN_URL = 'https://github.com/Jake-Shadle/xwin/releases/download/{v}/xwin-{v}-x86_64-pc-windows-msvc.tar.gz'
@@ -126,7 +126,7 @@ def find_llvm(vs_path):
             cands.append(os.path.dirname(w))
     best = None
     for c in cands:
-        if all(os.path.isfile(os.path.join(c, t + EXE)) for t in ('clang-cl', 'lld-link', 'llvm-lib')):
+        if all(os.path.isfile(os.path.join(c, t + EXE)) for t in ('clang', 'clang-cl', 'lld-link', 'llvm-lib')):
             v, text = clang_version(c)
             if v >= MIN_CLANG and (best is None or v > best[0]):
                 best = (v, c, text)
@@ -410,7 +410,11 @@ def run_quiet(cmd, env=None, what='compiling', log_name='build_last.txt'):
 
 class Toolchain:
     def __init__(self, llvm_bin, cmake, ninja, env, xwin_msc=None):
-        self.llvm_bin, self.cmake, self.ninja, self.env, self.xwin_msc = llvm_bin, cmake, ninja, env, xwin_msc
+        self.llvm_bin, self.cmake, self.ninja, self.xwin_msc = llvm_bin, cmake, ninja, xwin_msc
+        # RT64's build runs clang (shader preprocessing) by name
+        self.env = {k: v for k, v in env.items() if k.upper() != 'PATH'}   # vcvars spells it "Path"
+        old = next((v for k, v in env.items() if k.upper() == 'PATH'), os.environ.get('PATH', ''))
+        self.env['PATH'] = llvm_bin + os.pathsep + old
 
     def configure_args(self):
         b = fwd(self.llvm_bin)

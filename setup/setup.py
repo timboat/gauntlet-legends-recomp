@@ -242,8 +242,30 @@ def download(url, sha256, what):
     return data
 
 
+SDL2_ENDIAN_OLD = b'#ifdef __clang__\r\n#ifndef __PRFCHWINTRIN_H'
+SDL2_ENDIAN_NEW = (b'#if defined(__clang__) && __clang_major__ < 19 /* newer clang has _m_prefetch as a builtin */\r\n'
+                   b'#ifndef __PRFCHWINTRIN_H')
+
+
+def fix_sdl2_endian(root):
+    """SDL 2.30's SDL_endian.h defines _m_prefetch for clang, which clang 19+ has built in ("definition of
+    builtin function"): only for older clang."""
+    p = os.path.join(root, 'SDL2-2.30.9', 'include', 'SDL_endian.h')
+    with open(p, 'rb') as f:
+        s = f.read()
+    for nl in (b'\r\n', b'\n'):
+        old, new = SDL2_ENDIAN_OLD.replace(b'\r\n', nl), SDL2_ENDIAN_NEW.replace(b'\r\n', nl)
+        if old in s:
+            with open(p, 'wb') as f:
+                f.write(s.replace(old, new, 1))
+            return
+    if b'__clang_major__ < 19' not in s:
+        raise RuntimeError('SDL_endian.h is not the expected one')
+
+
 def get_sdl2():
     if os.path.isfile(os.path.join(SDL2_DIR, 'lib', 'x64', 'SDL2.dll')):
+        fix_sdl2_endian(os.path.join(DEPS, 'sdl2'))
         say('  deps\\sdl2: OK')
         return
     import io
@@ -252,6 +274,7 @@ def get_sdl2():
     shutil.rmtree(part, ignore_errors=True)
     with zipfile.ZipFile(io.BytesIO(data)) as z:
         z.extractall(part)
+    fix_sdl2_endian(part)
     shutil.rmtree(os.path.join(DEPS, 'sdl2'), ignore_errors=True)
     os.replace(part, os.path.join(DEPS, 'sdl2'))
     say('  deps\\sdl2: ready')

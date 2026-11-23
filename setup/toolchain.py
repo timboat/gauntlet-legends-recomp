@@ -175,7 +175,7 @@ def download_llvm():
         os.remove(part)
         say('  the LLVM download does not match its checksum; not using it')
         return False
-    say('  unpacking clang-cl, lld-link, llvm-lib, llvm-rc, llvm-mt and clang\'s headers ...')
+    say('  unpacking clang, clang-cl, lld-link, llvm-lib, llvm-rc, llvm-mt and clang\'s headers ...')
     final = os.path.join(ROOT, 'deps', 'llvm')
     dest = final + '.part'
     shutil.rmtree(dest, ignore_errors=True)
@@ -422,7 +422,7 @@ class Toolchain:
         if self.xwin_msc:
             args += [f'-DCMAKE_TOOLCHAIN_FILE={fwd(os.path.join(ROOT, "setup", "clang-cl-xwin.cmake"))}',
                      f'-DGL_LLVM_BIN={b}', f'-DGL_MSVC_COMPAT={self.xwin_msc}',
-                     '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>']
+                     '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded']
         else:
             args += [f'-DCMAKE_C_COMPILER={b}/clang-cl.exe', f'-DCMAKE_CXX_COMPILER={b}/clang-cl.exe',
                      f'-DCMAKE_LINKER={b}/lld-link.exe', f'-DCMAKE_RC_COMPILER={b}/llvm-rc.exe']

@@ -2,9 +2,13 @@
 # (deps/xwin), without Visual Studio. setup/toolchain.py passes GL_LLVM_BIN and puts the SDK's include and
 # library folders in the INCLUDE and LIB environment variables, which clang-cl and lld-link read the way
 # cl.exe and link.exe do.
-set(CMAKE_SYSTEM_NAME Windows)
-set(CMAKE_SYSTEM_VERSION 10.0)
-set(CMAKE_SYSTEM_PROCESSOR AMD64)
+# Only a non-Windows host cross-compiles. On Windows, naming the system would make CMake treat the build as
+# a cross build, and RT64's custom commands would then no longer find its own file_to_c tool.
+if(NOT CMAKE_HOST_WIN32)
+    set(CMAKE_SYSTEM_NAME Windows)
+    set(CMAKE_SYSTEM_VERSION 10.0)
+    set(CMAKE_SYSTEM_PROCESSOR AMD64)
+endif()
 
 # try_compile projects re-read this file without the -D values of the main configure
 list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES GL_LLVM_BIN GL_MSVC_COMPAT)
